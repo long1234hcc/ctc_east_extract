@@ -4,6 +4,7 @@ from openpyxl.worksheet.worksheet import Worksheet
 from collections import deque
 from typing import List, Dict, Set, Tuple, Any
 import numpy as np
+import pandas.api.types as pd_types
 import json
 
 
@@ -78,7 +79,6 @@ def _create_border_heatmap(ws: Worksheet, merged_map: Dict) -> List[List[bool]]:
 def _find_clusters(heatmap: List[List[bool]]) -> List[List[Tuple[int, int]]]:
     """
     Chạy thuật toán BFS (Breadth-First Search) trên heatmap
-    để tìm các "quần đảo" (cụm) các ô "Đất" (True) liền kề nhau.
     
     Returns:
         List các cụm, mỗi cụm là 1 List các tọa độ (r, c) (0-indexed).
@@ -203,11 +203,13 @@ def detect_tables(file_path: str, sheet_name: str,
     # Bước 2:
     print(f"Bước 2: Đang tạo bản đồ nhiệt border (có xử lý ô gộp)...")
     heatmap = _create_border_heatmap(ws, merged_map)
+    print("heatmap",heatmap)
     print("Bước 2: Hoàn thành.")
     
     # Bước 3:
     print(f"Bước 3: Đang tìm các cụm border...")
     clusters = _find_clusters(heatmap)
+    print("clusters",clusters)
     print(f"Bước 3: Hoàn thành. Tìm thấy {len(clusters)} cụm.")
     
     # Bước 4:
@@ -283,320 +285,6 @@ import json
 from typing import Dict, List, Any, Optional, Tuple
 import re
 
-
-class DynamicExcelParser:
-    """
-    Parser động cho bảng Excel với header nhiều cấp.
-    Tự động phát hiện cấu trúc và chuyển đổi sang nested JSON.
-    """
-    
-    def __init__(self, df: pd.DataFrame):
-        self.df = df
-        self.header_end_row = 0
-        self.data_start_row = 0
-        self.column_structure = []
-        
-    def parse(self) -> Dict[str, Any]:
-        """Parse toàn bộ DataFrame sang nested JSON."""
-        
-        # Bước 1: Tìm ranh giới giữa header và data
-        self._detect_header_boundary()
-        
-        # Bước 2: Parse cấu trúc header
-        self._parse_header_structure()
-        
-        # Bước 3: Parse dữ liệu
-        data_rows = self._parse_data_rows()
-        
-        return {
-            "metadata": {
-                "header_rows": self.header_end_row,
-                "data_start_row": self.data_start_row,
-                "total_columns": len(self.column_structure),
-                "column_structure": self.column_structure
-            },
-            "data": data_rows
-        }
-    
-    def _detect_header_boundary(self):
-        """
-        Tự động phát hiện hàng nào là ranh giới giữa header và data.
-        Sử dụng heuristic: hàng đầu tiên có pattern như ID-1, ID-2, hoặc ngày tháng thực.
-        """
-        
-        for idx in range(len(self.df)):
-            row = self.df.iloc[idx]
-            
-            # Kiểm tra cột thứ 2 (thường là ID)
-            if pd.notna(row[1]):
-                val = str(row[1]).strip()
-                
-                # Pattern: ID-số hoặc số thuần túy (không phải text mô tả)
-                if re.match(r'^ID-?\d+$', val, re.IGNORECASE) or \
-                   (val.isdigit() and int(val) < 1000):  # ID dạng số nhỏ
-                    self.data_start_row = idx
-                    self.header_end_row = idx
-                    break
-            
-            # Nếu có nhiều ô liên tiếp chứa số (dữ liệu thực)
-            numeric_count = sum(1 for v in row[2:] if self._is_numeric(v))
-            if numeric_count > len(row) * 0.3:  # >30% là số
-                self.data_start_row = idx
-                self.header_end_row = idx
-                break
-        
-        if self.header_end_row == 0:
-            # Fallback: giả sử 5 hàng đầu là header
-            self.header_end_row = min(5, len(self.df) - 1)
-            self.data_start_row = self.header_end_row
-    
-    def _is_numeric(self, val) -> bool:
-        """Kiểm tra giá trị có phải số không."""
-        if pd.isna(val):
-            return False
-        try:
-            float(val)
-            return True
-        except:
-            return False
-    
-    def _parse_header_structure(self):
-        """
-        Parse cấu trúc header động, tự động phát hiện các nhóm và nhóm con.
-        """
-        
-        header_rows = []
-        for idx in range(self.header_end_row):
-            header_rows.append(self.df.iloc[idx].values.tolist())
-        
-        if not header_rows:
-            # Không có header, mỗi cột là một field đơn giản
-            self.column_structure = [
-                {"col_index": i, "path": [f"Column_{i}"], "name": f"Column_{i}"}
-                for i in range(len(self.df.columns))
-            ]
-            return
-        
-        # Parse từng cột
-        num_cols = len(self.df.columns)
-        
-        for col_idx in range(num_cols):
-            col_path = self._build_column_path(header_rows, col_idx)
-            
-            self.column_structure.append({
-                "col_index": col_idx,
-                "path": col_path,
-                "name": col_path[-1] if col_path else f"Column_{col_idx}",
-                "full_path": " > ".join(col_path)
-            })
-    
-    def _build_column_path(self, header_rows: List[List], col_idx: int) -> List[str]:
-        """
-        Xây dựng path phân cấp cho một cột từ các hàng header.
-        
-        Logic:
-        - Đọc từ trên xuống dưới
-        - Bỏ qua NaN
-        - Phát hiện merged cells (giá trị trải dài nhiều cột)
-        - Xây dựng path: [Group] -> [SubGroup] -> [Column Name]
-        """
-        
-        path = []
-        
-        for row_idx, row in enumerate(header_rows):
-            val = row[col_idx]
-            
-            # Bỏ qua NaN
-            if pd.isna(val):
-                # Kiểm tra xem có phải merged cell không (tìm giá trị gần nhất bên trái)
-                merged_val = self._find_merged_value(row, col_idx)
-                if merged_val:
-                    # Chỉ thêm vào path nếu chưa có (tránh lặp)
-                    if not path or path[-1] != merged_val:
-                        path.append(merged_val)
-                continue
-            
-            val_str = str(val).strip()
-            
-            # Bỏ qua các giá trị rỗng hoặc ký tự đặc biệt
-            if not val_str or val_str in ['nan', 'NaN', 'None']:
-                continue
-            
-            # Thêm vào path nếu chưa có
-            if not path or path[-1] != val_str:
-                path.append(val_str)
-        
-        # Nếu path rỗng, đặt tên mặc định
-        if not path:
-            path = [f"Column_{col_idx}"]
-        
-        return path
-    
-    def _find_merged_value(self, row: List, col_idx: int) -> Optional[str]:
-        """
-        Tìm giá trị của merged cell bằng cách tìm ngược về bên trái.
-        """
-        
-        for i in range(col_idx - 1, -1, -1):
-            if pd.notna(row[i]):
-                val = str(row[i]).strip()
-                if val and val not in ['nan', 'NaN', 'None']:
-                    return val
-        
-        return None
-    
-    def _parse_data_rows(self) -> List[Dict[str, Any]]:
-        """Parse các hàng dữ liệu thành list of nested dictionaries."""
-        
-        data_rows = []
-        
-        for idx in range(self.data_start_row, len(self.df)):
-            row = self.df.iloc[idx]
-            
-            # Kiểm tra hàng rỗng (tất cả đều NaN)
-            if row.isna().all():
-                continue
-            
-            row_data = self._parse_single_row(row)
-            data_rows.append(row_data)
-        
-        return data_rows
-    
-    def _parse_single_row(self, row: pd.Series) -> Dict[str, Any]:
-        """
-        Parse một hàng dữ liệu thành nested dictionary dựa trên column_structure.
-        """
-        
-        result = {}
-        
-        for col_info in self.column_structure:
-            col_idx = col_info["col_index"]
-            path = col_info["path"]
-            value = self._safe_value(row[col_idx])
-            
-            # Xây dựng nested structure
-            self._set_nested_value(result, path, value)
-        
-        return result
-    
-    def _set_nested_value(self, data: Dict, path: List[str], value: Any):
-        """
-        Đặt giá trị vào nested dictionary theo path.
-        
-        Ví dụ: path = ["Group1", "SubGroup", "Data"] 
-               -> data["Group1"]["SubGroup"]["Data"] = value
-        """
-        
-        if not path:
-            return
-        
-        # Nếu path chỉ có 1 phần tử, gán trực tiếp
-        if len(path) == 1:
-            data[path[0]] = value
-            return
-        
-        # Nếu path có nhiều phần tử, tạo nested structure
-        current = data
-        
-        for i, key in enumerate(path[:-1]):
-            if key not in current:
-                current[key] = {}
-            elif not isinstance(current[key], dict):
-                # Xung đột: key đã tồn tại nhưng không phải dict
-                # Chuyển thành dict và giữ giá trị cũ
-                old_value = current[key]
-                current[key] = {"_value": old_value}
-            
-            current = current[key]
-        
-        # Đặt giá trị cuối cùng
-        final_key = path[-1]
-        current[final_key] = value
-    
-    def _safe_value(self, val: Any) -> Any:
-        """Chuyển đổi giá trị an toàn, xử lý NaN và kiểu dữ liệu."""
-        
-        if pd.isna(val):
-            return None
-        
-        # Chuyển numpy types sang Python native types
-        if hasattr(val, 'item'):
-            val = val.item()
-        
-        # Xử lý số
-        if isinstance(val, (int, float)):
-            if isinstance(val, float):
-                if val.is_integer():
-                    return int(val)
-            return val
-        
-        # Xử lý chuỗi
-        val_str = str(val).strip()
-        return val_str if val_str else None
-
-
-def excel_to_nested_json(df: pd.DataFrame, 
-                         output_file: Optional[str] = None,
-                         indent: int = 2) -> Dict[str, Any]:
-    """
-    Chuyển đổi DataFrame với header nhiều cấp sang nested JSON.
-    
-    Function này hoàn toàn ĐỘNG - tự động phát hiện cấu trúc header.
-    
-    Parameters:
-    -----------
-    df : pd.DataFrame
-        DataFrame đọc từ Excel với header=None
-    output_file : str, optional
-        Đường dẫn file JSON output. Nếu None, không ghi file.
-    indent : int
-        Số space cho indentation trong JSON
-        
-    Returns:
-    --------
-    dict : Nested JSON structure
-    
-    Example:
-    --------
-    >>> import pandas as pd
-    >>> df = pd.read_excel('data.xlsx', header=None)
-    >>> result = excel_to_nested_json(df, 'output.json')
-    >>> print(json.dumps(result, indent=2, ensure_ascii=False))
-    """
-    
-    parser = DynamicExcelParser(df)
-    result = parser.parse()
-    
-    # Ghi file nếu được chỉ định
-    if output_file:
-        with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(result, f, indent=indent, ensure_ascii=False)
-        print(f"✅ Đã lưu JSON vào: {output_file}")
-        print(f"📊 Số hàng dữ liệu: {len(result['data'])}")
-        print(f"📋 Số cột: {result['metadata']['total_columns']}")
-    
-    return result
-
-
-def visualize_structure(result: Dict[str, Any]) -> None:
-    """
-    In ra cấu trúc cột để kiểm tra.
-    """
-    print("\n" + "="*80)
-    print("CẤU TRÚC CỘT ĐƯỢC PHÁT HIỆN")
-    print("="*80)
-    
-    for col in result['metadata']['column_structure']:
-        print(f"Cột {col['col_index']:2d}: {col['full_path']}")
-    
-    print("\n" + "="*80)
-    print(f"Tổng số cột: {result['metadata']['total_columns']}")
-    print(f"Số hàng header: {result['metadata']['header_rows']}")
-    print(f"Số hàng dữ liệu: {len(result['data'])}")
-    print("="*80 + "\n")
-
-
-
 # --- [GIAI ĐOẠN 2: PARSE LOGIC - HÀM MỚI] ---
 
 
@@ -644,7 +332,7 @@ def detect_header_split_point(
         
         real_row_above = boundary['min_row'] + r_idx
         real_row_below = boundary['min_row'] + r_idx + 1
-        
+        print(r_idx, real_row_above, real_row_below)
         horizontal_count = 0
         
         # Quét từ trái qua phải
@@ -716,21 +404,24 @@ def detect_header_split_point(
 
 
 
-
-def detect_attribute_boundary(header_df: pd.DataFrame) -> Tuple[List[int], List[int]]:
+def detect_attribute_boundary(
+    header_df: pd.DataFrame, 
+    data_df: pd.DataFrame 
+) -> Tuple[List[int], List[int]]:
     """
-    (Hàm MỚI - Bước 2.5)
-    Phân tích `header_df` (Cái Khuôn) để tìm "Ranh giới Thuộc tính".
+    (Phiên bản V8 - Logic "Chốt" của bạn)
+    Phân tích `header_df` VÀ `data_df` để tìm ranh giới Thuộc tính.
     
-    Quy tắc (Heuristic):
-    - "Cột Thuộc tính" (Ngày, ID) chỉ có giá trị ở hàng đầu tiên (index 0).
-    - "Cột Dữ liệu" (Group 1) có giá trị ở cả hàng 0 VÀ các hàng dưới.
-    - Ranh giới là cột "Dữ liệu" đầu tiên được tìm thấy.
-    
-    Returns:
-        Một tuple chứa 2 list: (attribute_cols_idx, data_cols_idx)
+    Quy tắc (Heuristic) của bạn:
+    Một cột là "THUỘC TÍNH" NẾU:
+    1. (Logic Header) "Thân" (body) của nó trong header rỗng (do gộp dọc).
+       HOẶC LÀ
+    2. (Logic Data) Nó là cột kiểu "văn bản" (string/object) VÀ 
+       có chứa dữ liệu gộp (phát hiện bằng cách tìm cả giá trị và NaN).
+       
+    Cột ĐẦU TIÊN không thỏa mãn cả 2 điều kiện trên là "vách đá" (ranh giới).
     """
-    print(f"\n[detect_attribute_boundary] Phân tích {header_df.shape[1]} cột header...")
+    print(f"\n[detect_attribute_boundary] Phân tích {header_df.shape[1]} cột header (Logic Hybrid)...")
     
     attribute_cols_idx = []
     data_cols_idx = []
@@ -738,45 +429,51 @@ def detect_attribute_boundary(header_df: pd.DataFrame) -> Tuple[List[int], List[
     total_header_rows = header_df.shape[0]
     total_cols = header_df.shape[1]
 
-    # Trường hợp Bảng Đơn giản (header_df chỉ có 1 hàng)
-    if total_header_rows == 1:
-        print("  -> Phát hiện Bảng Đơn giản (1 hàng header).")
-        # Giả định: Cột đầu tiên là Thuộc tính, còn lại là Dữ liệu
-        attribute_cols_idx = [0]
-        data_cols_idx = list(range(1, total_cols))
-        
-        print(f"  -> Cột Thuộc tính: {attribute_cols_idx}")
-        print(f"  -> Cột Dữ liệu: {data_cols_idx}")
-        return attribute_cols_idx, data_cols_idx
-
-    # Trường hợp Bảng Phức tạp (header_df có > 1 hàng)
-    print("  -> Phát hiện Bảng Phức tạp (>1 hàng header).")
+    # --- (TOÀN BỘ LOGIC BÊN DƯỚI ĐÃ ĐƯỢC VIẾT LẠI) ---
     
+    # Lặp qua TẤT CẢ các cột để kiểm tra
     for c_idx in header_df.columns:
-        # Lấy "thân" của cột (tất cả các hàng TRỪ hàng đầu tiên)
+        
+        # --- Check 1: Logic Header (Thân rỗng) ---
         column_body = header_df.iloc[1: , c_idx]
+        body_is_empty = column_body.isna().all()
+        # (Nếu thân rỗng, nó là thuộc tính)
+        is_header_attr = body_is_empty
         
-        # Kiểm tra xem "thân" có dữ liệu (không phải toàn NaN) không
-        body_has_data = not column_body.isna().all()
+        # --- Check 2: Logic Data (Gộp dọc trong data) ---
+        data_column = data_df.iloc[:, c_idx]
         
-        if body_has_data:
-            # Đây là ranh giới! Cột này là "Cột Dữ liệu" đầu tiên.
-            print(f"  -> Ranh giới tại Cột {c_idx} (vì có '{column_body.loc[column_body.notna().idxmax()]}')")
+        # 2a. Kiểm tra kiểu dữ liệu an toàn (tránh nhầm lẫn NaN của số)
+        dtype = pd_types.infer_dtype(data_column, skipna=True)
+        is_string_like = dtype in ('string', 'object', 'mixed', 'unknown', 'datetime', 'date')
+        
+        # 2b. Kiểm tra xem có phải là cột gộp không (có cả giá trị và NaN)
+        has_nans = data_column.isna().any()
+        has_values = data_column.notna().any()
+        
+        # (Nếu là kiểu string VÀ có cả NaN/giá trị -> nó là thuộc tính gộp)
+        is_data_attr = is_string_like and has_nans and has_values
+
+        
+        # --- Quyết định cuối cùng (Logic "HOẶC" của bạn) ---
+        if is_header_attr or is_data_attr:
+            # Nếu 1 trong 2 đúng, đây là Cột Thuộc tính
+            print(f"  -> Cột {c_idx} là Cột Thuộc tính (Header: {is_header_attr}, Data: {is_data_attr})")
+            attribute_cols_idx.append(c_idx)
+        else:
+            # Đây là "vách đá" - Cột Dữ liệu đầu tiên
+            # (Nó không có thân header rỗng VÀ nó không phải là cột data gộp)
+            print(f"  -> Ranh giới tại Cột {c_idx} (Không phải Thuộc tính)")
             
             # Tất cả các cột từ đây về sau ĐỀU LÀ Cột Dữ liệu
             data_cols_idx = list(range(c_idx, total_cols))
             
             # Thoát vòng lặp
             break
-        else:
-            # Nếu "thân" toàn NaN, đây là "Cột Thuộc tính"
-            print(f"  -> Cột {c_idx} ('{header_df.iloc[0, c_idx]}') là Cột Thuộc tính.")
-            attribute_cols_idx.append(c_idx)
 
-    print(f"\n  -> [CHỐT] Cột Thuộc tính: {attribute_cols_idx}")
-    print(f"  -> [CHỐT] Cột Dữ liệu: {data_cols_idx}")
+    print(f"\n  -> [CHỐT] Cột Thuộc tính: {attribute_cols_idx}")
+    print(f"  -> [CHỐT] Cột Dữ liệu: {data_cols_idx}")
     return attribute_cols_idx, data_cols_idx
-
 
 # --- [GIAI ĐOẠN 3: Trích xuất JSON] ---
 
@@ -829,7 +526,11 @@ def _build_header_map(header_df: pd.DataFrame, data_cols: List[int]) -> Dict[int
             
             # Chỉ thêm nếu nó không NaN VÀ không bị lặp lại
             if pd.notna(value) and value != last_val:
-                path.append(value)
+                if isinstance(value, str):
+                    path.append(value)
+                else:
+                    print(f"  ⚠ Cảnh báo: Giá trị không phải chuỗi ở header (hàng {r_idx}, cột {c_idx}): {value}")
+                    path.append(str(value))
                 last_val = value
         
         header_map[c_idx] = path
@@ -844,9 +545,9 @@ def parse_table_to_long_json(
     data_cols: List[int]
 ) -> List[Dict[str, Any]]:
     """
-    (Hàm MỚI - Bước 2.4)
-    Lắp ráp JSON theo định dạng "Dài" (Long Format)
-    (Một object JSON cho mỗi Ô dữ liệu).
+    (Hàm MỚI - Bước 2.4 - ĐÃ SỬA LOGIC)
+    Lắp ráp JSON theo định dạng "Rộng" (Wide Format)
+    (Tạo MỘT object JSON cho mỗi HÀNG dữ liệu, gộp tất cả các cột).
     """
     
     final_json_list = []
@@ -856,27 +557,36 @@ def parse_table_to_long_json(
     # Bản đồ 1: "Bản đồ Header" (Tra cứu Path theo Cột)
     header_map = _build_header_map(header_df, data_cols)
     
+    print("header_map",header_map)
+    
     # Bản đồ 2: "Tên Thuộc tính" (Lấy tên "Ngày", "ID" từ hàng đầu)
     attribute_key_names = [header_df.iloc[0, c_idx] for c_idx in attribute_cols]
     
     print(f"[parse_table_to_long_json] Đang lấp đầy (ffill) các thuộc tính gộp...")
     filled_data_df = data_df.copy()
     filled_data_df.loc[:, attribute_cols] = filled_data_df.loc[:, attribute_cols].ffill()
-    # --- 2. Vòng lặp Kép (Lắp ráp Ô) ---
     
-    print(f"[parse_table_to_long_json] Đang lắp ráp các ô...")
+    # --- 2. Vòng lặp Kép (ĐÃ SỬA LOGIC LẮP RÁP) ---
+    
+    print(f"[parse_table_to_long_json] Đang lắp ráp các HÀNG (rows)...") # Đã sửa log
+    
     # Lặp qua các HÀNG DỮ LIỆU (ví dụ: index 5, 6)
     for r_idx in filled_data_df.index:
         
         # a. Lấy "Bản ghi Thuộc tính" (Attribute Record) cho hàng này
-        # (Lấy 1 lần cho mỗi hàng)
         base_record = {}
         for i, c_idx in enumerate(attribute_cols):
             key = attribute_key_names[i]
             value = filled_data_df.loc[r_idx, c_idx]
             base_record[key] = value
+            # print("base_record",base_record)
         
-        # b. Lặp qua các CỘT DỮ LIỆU (ví dụ: 2, 3, ..., 25)
+        # --- [SỬA LỖI 1] ---
+        # Tạo MỘT bản sao DUY NHẤT cho CẢ HÀNG
+        # (Di chuyển ra ngoài vòng lặp 'c_idx')
+        record = base_record.copy() 
+        
+        # b. Lặp qua các CỘT DỮ LIỆU (ví dụ: 1, 2, ..., 29)
         for c_idx in data_cols:
             
             # i. Lấy Giá trị (Value)
@@ -888,23 +598,50 @@ def parse_table_to_long_json(
                 
             # ii. Lấy "Con đường" (Path)
             path = header_map[c_idx]
+            # print("path",path)
             
             # iii. Lắp ráp
             
-            # Tạo bản sao của "Bản ghi Thuộc tính"
-            record = base_record.copy() 
+            # (Dòng 'record = base_record.copy()' ĐÃ BỊ XÓA KHỎI ĐÂY)
             
             # Tạo object lồng nhau (Keys)
             nested_data_obj = {}
             _set_nested_value(nested_data_obj, path, value)
             
             # Gộp 2 phần lại
+            # CẬP NHẬT (update) vào 'record' duy nhất của hàng
             record.update(nested_data_obj)
+            # print("record",record)
             
-            # Thêm vào kết quả cuối cùng
-            final_json_list.append(record)
+            # (Dòng 'final_json_list.append(record)' ĐÃ BỊ XÓA KHỎI ĐÂY)
+            
+        # --- [SỬA LỖI 2] ---
+        # Thêm vào kết quả cuối cùng SAU KHI lặp xong TẤT CẢ các cột
+        # (Di chuyển ra ngoài vòng lặp 'c_idx')
+        final_json_list.append(record)
             
     return final_json_list
+
+
+def transform_all_data_in_json_to_string(
+    json_data: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """
+    (Hàm MỚI - Bước 2.5)
+    Chuyển đổi tất cả giá trị trong JSON sang chuỗi (string).
+    """
+    
+    def convert_value_to_string(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {k: convert_value_to_string(v) for k, v in value.items()}
+        elif isinstance(value, list):
+            return [convert_value_to_string(v) for v in value]
+        elif value is None:
+            return ""
+        else:
+            return str(value)
+    
+    return [convert_value_to_string(record) for record in json_data]
 
 
 if __name__ == "__main__":
@@ -1126,7 +863,9 @@ if __name__ == "__main__":
 
     
 
-    FILE_PATH = "Book1.xlsx" 
+    FILE_PATH = "Book3.xlsx" 
+    # FILE_PATH = "cloned_excel.xlsx" 
+    # SHEET_NAME = "Sheet1" 
     SHEET_NAME = "Sheet1" 
 
     # --- PHẢI LOAD `worksheet` TRƯỚC ---
@@ -1135,6 +874,9 @@ if __name__ == "__main__":
         if SHEET_NAME not in wb.sheetnames:
             raise ValueError(f"Không tìm thấy sheet '{SHEET_NAME}'")
         worksheet = wb[SHEET_NAME]
+        ## transform to string
+        
+        
         
         # Tạo merged_map MỘT LẦN ở đây
         merged_map = _create_merged_cell_map(worksheet) 
@@ -1152,6 +894,8 @@ if __name__ == "__main__":
         min_width=2,
         min_height=2
     )
+    
+    print("table_coordinates",table_coordinates)
     print(f"--- [GIAI ĐOẠN 1] Hoàn thành: Tìm thấy {len(table_coordinates)} bảng ---")
 
     all_parsed_data = [] 
@@ -1161,6 +905,8 @@ if __name__ == "__main__":
         print(f"\n--- Xử lý Bảng {i+1} (Hàng {coords['min_row']}->{coords['max_row']}) ---")
         
         raw_table_df = debug_extract_data(FILE_PATH, SHEET_NAME, coords)
+        # raw_table_df = transform_dataframe_to_all_string(raw_table_df)
+
         
         if raw_table_df.empty:
             continue
@@ -1181,11 +927,14 @@ if __name__ == "__main__":
                  continue
 
             header_df = raw_table_df.iloc[0 : split_point_index]
+            # print("raw_table_df",raw_table_df.head(5))
+            # print(header_df.head())
+            ## transform header to string
             data_df = raw_table_df.iloc[split_point_index : ]
             
             # --- BƯỚC 2.2: TÌM RANH GIỚI THUỘC TÍNH ---
-            attribute_cols, data_cols = detect_attribute_boundary(header_df)
-            
+            attribute_cols, data_cols = detect_attribute_boundary(header_df, data_df)
+            print(attribute_cols, data_cols)
             # --- BƯỚC 2.3 & 2.4: LẮP RÁP JSON ---
             try:
                 # Chạy hàm parse JSON (Định dạng "Dài")
@@ -1195,7 +944,8 @@ if __name__ == "__main__":
                     attribute_cols, 
                     data_cols
                 )
-                
+
+            
                 all_parsed_data.extend(json_output)
                 print(f"\n--- [GIAI ĐOẠN 2] Parse Bảng {i+1} thành công. Tạo ra {len(json_output)} bản ghi JSON.")
 
@@ -1215,6 +965,14 @@ if __name__ == "__main__":
     
     # In toàn bộ kết quả cuối cùng
     print("\n--- TỔNG KẾT JSON ---")
+    
+    # from pprint import pprint
+    
+    # all_parsed_data = transform_all_data_in_json_to_string(all_parsed_data)
+    # pprint(all_parsed_data)
+
+    # from helper.json_helper import convert_numpy_types
+    # converted_data = convert_numpy_types(all_parsed_data)
     json_response = json.dumps(all_parsed_data, indent=2, ensure_ascii=False)
 
     ## Save to file
